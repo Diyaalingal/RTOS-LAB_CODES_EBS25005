@@ -128,3 +128,291 @@ void setup() {
 }
 
 void loop() { vTaskDelete(NULL); }
+
+
+ZEPHYRTOS CODES:
+
+CMAKELISTS.TXT
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(energy_meter)
+
+target_sources(app PRIVATE src/main.c)
+
+PRJ.CONF
+# Enable standard C libraries and Floating Point Math (for RMS)
+CONFIG_NEWLIB_LIBC=y
+CONFIG_FPU=y
+
+# Enable Hardware Drivers
+CONFIG_ADC=y
+CONFIG_I2C=y
+CONFIG_GPIO=y  # Required for the I2C backpack
+
+# Enable the Character LCD Driver
+CONFIG_AUXDISPLAY=y
+CONFIG_AUXDISPLAY_HD44780=y
+
+# Enable Logging for the serial monitor
+CONFIG_LOG=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+# Enable Zephyr Thread Analyzer (For your monitoring task)
+CONFIG_THREAD_ANALYZER=y
+CONFIG_THREAD_ANALYZER_USE_LOG=y
+CONFIG_THREAD_NAME=y
+
+# Enable the specific driver for the I2C LCD Backpack
+CONFIG_GPIO_PCF857X=y
+
+MAIN.C
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/auxdisplay.h>
+#include <zephyr/debug/thread_analyzer.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <zephyr/drivers/gpio.h> 
+
+LOG_MODULE_REGISTER(energy_meter, LOG_LEVEL_INF);
+
+// ================= CONSTANTS & SETTINGS =================
+#define THREAD_STACK_SIZE 4096
+#define ADC_MAX 4095.0f
+#define ADC_REF 3.3f
+#define ACS_SENSITIVITY 0.185f
+#define CURRENT_NOISE_CUTOFF 0.003f
+
+float voltageCalibration = 559.15f; 
+float currentCalibration = 18.0f;   
+float offCurrentBaseline = 0.045f;  
+
+// ================= SHARED VARIABLES =================
+K_MUTEX_DEFINE(data_mutex);
+float voltageRMS = 0.0f, currentRMS = 0.0f, powerWatt = 0.0f, energyWh = 0.0f;
+float currentOffset = 0.0f, voltageOffset = 0.0f;
+uint32_t blockingTimeMs = 0;
+
+// ================= DEVICE SETUP =================
+const struct device *adc_dev = DEVICE_DT_GET(DT_ALIAS(current_adc));
+const struct device *const lcd_dev = DEVICE_DT_GET(DT_NODELABEL(auxdisplay));
+
+static const struct adc_channel_cfg current_channel_cfg = {
+    .gain = ADC_GAIN_1,
+    .reference = ADC_REF_INTERNAL,
+    .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+    .channel_id = 4,
+};
+
+static const struct adc_channel_cfg voltage_channel_cfg = {
+    .gain = ADC_GAIN_1,
+    .reference = ADC_REF_INTERNAL,
+    .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+    .channel_id = 7,
+};
+
+// ================= CALIBRATION =================
+void calibrateOffsets(void) {
+    long currentSum = 0, voltageSum = 0;
+    int16_t sample_buffer[1];
+    struct adc_sequence seq = { .buffer = sample_buffer, .buffer_size = sizeof(sample_buffer), .resolution = 12 };
+
+    for (int i = 0; i < 2000; i++) {
+        seq.channels = BIT(4); adc_read(adc_dev, &seq); currentSum += sample_buffer[0];
+        seq.channels = BIT(7); adc_read(adc_dev, &seq); voltageSum += sample_buffer[0];
+        k_busy_wait(200); // 200 microseconds
+    }
+    currentOffset = currentSum / 2000.0f;
+    voltageOffset = voltageSum / 2000.0f;
+    LOG_INF("Calibration Done. I_Off: %.2f, V_Off: %.2f", (double)currentOffset, (double)voltageOffset);
+}
+
+// ================= TASKS =================
+void measurement_thread(void) {
+    int16_t sample_buffer[1];
+    struct adc_sequence seq = { .buffer = sample_buffer, .buffer_size = sizeof(sample_buffer), .resolution = 12 };
+
+    while (1) {
+        double currentSumSq = 0.0, voltageSumSq = 0.0;
+        for (int i = 0; i < 1000; i++) {
+            seq.channels = BIT(4); adc_read(adc_dev, &seq);
+            double c_val = ((sample_buffer[0] - currentOffset) * ADC_REF / ADC_MAX);
+            currentSumSq += (c_val * c_val);
+
+            seq.channels = BIT(7); adc_read(adc_dev, &seq);
+            double v_val = ((sample_buffer[0] - voltageOffset) * ADC_REF / ADC_MAX);
+            voltageSumSq += (v_val * v_val);
+            
+            k_busy_wait(200);
+        }
+
+        // Track Mutex Blocking Time
+        int64_t startWait = k_uptime_get();
+        k_mutex_lock(&data_mutex, K_FOREVER);
+        blockingTimeMs = (uint32_t)(k_uptime_get() - startWait);
+        
+        voltageRMS = (float)(sqrt(voltageSumSq / 1000.0) * (double)voltageCalibration);
+        currentRMS = (float)((sqrt(currentSumSq / 1000.0) / (double)ACS_SENSITIVITY) - (double)offCurrentBaseline);
+        if (currentRMS < CURRENT_NOISE_CUTOFF) currentRMS = 0.0f;
+        
+        k_mutex_unlock(&data_mutex);
+        k_msleep(1000);
+    }
+}
+
+void calculation_thread(void) {
+    while (1) {
+        float v, i;
+        k_mutex_lock(&data_mutex, K_FOREVER);
+        v = voltageRMS; i = currentRMS;
+        k_mutex_unlock(&data_mutex);
+
+        float p = v * i;
+        
+        k_mutex_lock(&data_mutex, K_FOREVER);
+        powerWatt = p;
+        energyWh += (powerWatt / 3600.0f);
+        k_mutex_unlock(&data_mutex);
+        
+        k_msleep(1000);
+    }
+}
+
+void lcd_display_thread(void) {
+    char buf1[17];
+    char buf2[17];
+
+    while (1) {
+        float v, i, p, e;
+        k_mutex_lock(&data_mutex, K_FOREVER);
+        v = voltageRMS; i = currentRMS; p = powerWatt; e = energyWh;
+        k_mutex_unlock(&data_mutex);
+
+        // --- NEW LINE: Send data to the Serial Monitor for Python to read! ---
+        LOG_INF("V: %.2f | I: %.2f | P: %.2f", (double)v, (double)i, (double)p);
+
+        snprintf(buf1, sizeof(buf1), "V:%.0f I:%.3f", (double)v, (double)i);
+        snprintf(buf2, sizeof(buf2), "P:%.1f E:%.3f", (double)p, (double)(e/1000.0f));
+
+        auxdisplay_clear(lcd_dev);
+        auxdisplay_cursor_position_set(lcd_dev, AUXDISPLAY_POSITION_ABSOLUTE, 0, 0);
+        auxdisplay_write(lcd_dev, buf1, strlen(buf1));
+        auxdisplay_cursor_position_set(lcd_dev, AUXDISPLAY_POSITION_ABSOLUTE, 0, 1);
+        auxdisplay_write(lcd_dev, buf2, strlen(buf2));
+
+        k_msleep(1000);
+    }
+}
+
+void monitoring_thread(void) {
+    while (1) {
+        LOG_INF("\n--- RTOS PERFORMANCE METRICS ---");
+        LOG_INF("Mutex Block Time: %u ms", blockingTimeMs);
+        
+        // Zephyr's equivalent of uxTaskGetSystemState
+        thread_analyzer_print(0);
+        
+        k_msleep(5000);
+    }
+}
+
+int main(void) {
+    if (!device_is_ready(adc_dev)) { LOG_ERR("ADC not ready!"); return -1; }
+    
+    // --- FORCE I2C BACKPACK PINS ---
+    // Because we deleted the read/write pin from the Device Tree, we must
+    // manually tell the backpack to stay in Write Mode (LOW) and keep the Backlight ON (HIGH)
+    const struct device *pcf_dev = DEVICE_DT_GET(DT_NODELABEL(pcf8574));
+    if (device_is_ready(pcf_dev)) {
+        gpio_pin_configure(pcf_dev, 1, GPIO_OUTPUT_INACTIVE); // Pin 1: R/W LOW
+        gpio_pin_configure(pcf_dev, 3, GPIO_OUTPUT_ACTIVE);   // Pin 3: Backlight HIGH
+    }
+
+    if (device_is_ready(lcd_dev)) {
+        auxdisplay_display_on(lcd_dev);
+        auxdisplay_clear(lcd_dev);
+    }
+
+    adc_channel_setup(adc_dev, &current_channel_cfg);
+    adc_channel_setup(adc_dev, &voltage_channel_cfg);
+    
+    calibrateOffsets();
+    
+    return 0; 
+}
+
+// Zephyr Native Thread Spawning (Priority: Lower number = Higher Priority)
+K_THREAD_DEFINE(meas_tid, THREAD_STACK_SIZE, measurement_thread, NULL, NULL, NULL, 3, 0, 0);
+K_THREAD_DEFINE(calc_tid, THREAD_STACK_SIZE, calculation_thread, NULL, NULL, NULL, 4, 0, 0);
+K_THREAD_DEFINE(lcd_tid,  THREAD_STACK_SIZE, lcd_display_thread, NULL, NULL, NULL, 5, 0, 0);
+K_THREAD_DEFINE(mon_tid,  THREAD_STACK_SIZE, monitoring_thread,  NULL, NULL, NULL, 6, 0, 0);
+
+APP OVERLAY
+/ {
+    aliases {
+        current-adc = &adc0;
+        voltage-adc = &adc0;
+    };
+
+    auxdisplay: auxdisplay {
+        compatible = "hit,hd44780";
+        columns = <16>;
+        rows = <2>;
+        mode = <4>;
+        
+        register-select-gpios = <&pcf8574 0 GPIO_ACTIVE_HIGH>;
+        enable-gpios = <&pcf8574 2 GPIO_ACTIVE_HIGH>;
+        backlight-gpios = <&pcf8574 3 GPIO_ACTIVE_HIGH>;
+        
+        /* Restored to 8 items to satisfy Zephyr driver constraints */
+        data-bus-gpios = <&pcf8574 0 0>, 
+                         <&pcf8574 0 0>, 
+                         <&pcf8574 0 0>, 
+                         <&pcf8574 0 0>,
+                         <&pcf8574 4 GPIO_ACTIVE_HIGH>,
+                         <&pcf8574 5 GPIO_ACTIVE_HIGH>,
+                         <&pcf8574 6 GPIO_ACTIVE_HIGH>,
+                         <&pcf8574 7 GPIO_ACTIVE_HIGH>;
+        status = "okay";
+    };
+};
+
+&adc0 {
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    channel@4 {
+        reg = <4>;
+        zephyr,gain = "ADC_GAIN_1";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,resolution = <12>;
+        zephyr,input-positive = <32>; 
+    };
+
+    channel@7 {
+        reg = <7>;
+        zephyr,gain = "ADC_GAIN_1";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,resolution = <12>;
+        zephyr,input-positive = <35>; 
+    };
+};
+
+&i2c0 {
+    status = "okay";
+    clock-frequency = <I2C_BITRATE_STANDARD>;
+
+    pcf8574: pcf8574@27 {
+        compatible = "nxp,pcf857x"; 
+        reg = <0x27>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        ngpios = <8>;
+        status = "okay";
+    };
+};
