@@ -1,1 +1,130 @@
+FREERTOS CODE:
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define ACS_PIN 32
+#define VOLT_PIN 35
+#define ADC_MAX 4095.0
+#define ADC_REF 3.3
+#define ACS_SENSITIVITY 0.185
+#define CURRENT_NOISE_CUTOFF 0.003
+
+float voltageCalibration = 559.15; 
+float currentCalibration = 18.0;   
+float offCurrentBaseline = 0.045;  
+
+float voltageRMS = 0.0, currentRMS = 0.0, powerWatt = 0.0, energyWh = 0.0;
+float currentOffset = 0.0, voltageOffset = 0.0;
+uint32_t blockingTimeMs = 0;
+
+SemaphoreHandle_t dataMutex;
+
+void calibrateOffsets() {
+    long currentSum = 0, voltageSum = 0;
+    for (int i = 0; i < 2000; i++) {
+        currentSum += analogRead(ACS_PIN);
+        voltageSum += analogRead(VOLT_PIN);
+        delayMicroseconds(200);
+    }
+    currentOffset = currentSum / 2000.0;
+    voltageOffset = voltageSum / 2000.0;
+}
+
+void measurementTask(void *parameter) {
+    while (1) {
+        double currentSumSq = 0.0, voltageSumSq = 0.0;
+        for (int i = 0; i < 1000; i++) {
+            currentSumSq += pow(((analogRead(ACS_PIN) - currentOffset) * ADC_REF / ADC_MAX), 2);
+            voltageSumSq += pow(((analogRead(VOLT_PIN) - voltageOffset) * ADC_REF / ADC_MAX), 2);
+            delayMicroseconds(200);
+        }
+
+        TickType_t startWait = xTaskGetTickCount();
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        blockingTimeMs = (xTaskGetTickCount() - startWait) * portTICK_PERIOD_MS;
+        
+        voltageRMS = sqrt(voltageSumSq / 1000) * voltageCalibration;
+        currentRMS = (sqrt(currentSumSq / 1000) / ACS_SENSITIVITY) - offCurrentBaseline;
+        if (currentRMS < CURRENT_NOISE_CUTOFF) currentRMS = 0.0;
+        
+        xSemaphoreGive(dataMutex);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void calculationTask(void *parameter) {
+    while (1) {
+        float v, i;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        v = voltageRMS; i = currentRMS;
+        xSemaphoreGive(dataMutex);
+
+        powerWatt = v * i;
+        
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        energyWh += (powerWatt / 3600.0);
+        xSemaphoreGive(dataMutex);
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void lcdDisplayTask(void *parameter) {
+    while (1) {
+        float v, i, p, e;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        v = voltageRMS; i = currentRMS; p = powerWatt; e = energyWh;
+        xSemaphoreGive(dataMutex);
+
+        // --- Stream data to the Python Dashboard ---
+        Serial.printf("V: %.2f | I: %.2f | P: %.2f\n", v, i, p);
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("V:"); lcd.print(v, 0); lcd.print(" I:"); lcd.print(i, 3);
+        lcd.setCursor(0, 1);
+        lcd.print("P:"); lcd.print(p, 1); lcd.print(" E:"); lcd.print(e/1000.0, 3);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void monitoringTask(void *parameter) {
+    while (1) {
+        Serial.println("\n--- RTOS PERFORMANCE METRICS ---");
+        
+        // --- Match the Zephyr output string exactly ---
+        Serial.printf("Mutex Block Time: %d ms | Heap: %d\n", blockingTimeMs, esp_get_free_heap_size());
+        
+        UBaseType_t uxArraySize = uxTaskGetNumberOfTasks();
+        TaskStatus_t *pxTaskStatusArray = (TaskStatus_t *)pvPortMalloc(uxArraySize * sizeof(TaskStatus_t));
+        uxArraySize = uxTaskGetSystemState(pxTaskStatusArray, uxArraySize, NULL);
+        
+        for(UBaseType_t i=0; i<uxArraySize; i++) {
+            Serial.printf("Task: %s | State: %d | Priority: %d\n", 
+                          pxTaskStatusArray[i].pcTaskName, pxTaskStatusArray[i].eCurrentState, pxTaskStatusArray[i].uxCurrentPriority);
+        }
+        vPortFree(pxTaskStatusArray);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    analogReadResolution(12);
+    analogSetPinAttenuation(ACS_PIN, ADC_11db);
+    analogSetPinAttenuation(VOLT_PIN, ADC_11db);
+    Wire.begin(21, 22);
+    lcd.init(); lcd.backlight();
+    
+    dataMutex = xSemaphoreCreateMutex();
+    calibrateOffsets();
+    
+    xTaskCreatePinnedToCore(measurementTask, "MeasTask", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(calculationTask, "CalcTask", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(lcdDisplayTask, "LCDTask", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(monitoringTask, "MonitorTask", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() { vTaskDelete(NULL); }
